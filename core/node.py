@@ -1,7 +1,12 @@
 import threading
 from xmlrpc.server import SimpleXMLRPCServer
+from socketserver import ThreadingMixIn  # Add this import
 import xmlrpc.client
 import time
+import json
+import os
+from google import genai
+from google.genai import types
 
 class Node:
         def __init__(self, node_id, port, peer_ports):
@@ -33,11 +38,17 @@ class Node:
             self.cs_replies_received = 0
             self.deferred_requests = []
             self.cs_lock = threading.Lock() # Protects DME state from race conditions
+            # Phase 5: AI Integration
+            try:
+                self.ai_client = genai.Client()
+                self.ai_model = 'gemini-2.5-flash'
+            except Exception as e:
+                print(f"[Node {self.node_id}] Warning: AI client failed to initialize. {e}")
 
         def _start_server(self):
             """Phase 1: Initialize the XML-RPC server to listen for incoming messages."""
-            # logRequests=False keeps the terminal from getting too messy
-            server = SimpleXMLRPCServer(("localhost", self.port), logRequests=False, allow_none=True)
+            # Replace SimpleXMLRPCServer with ThreadedXMLRPCServer
+            server = ThreadedXMLRPCServer(("localhost", self.port), logRequests=False, allow_none=True)
             server.register_instance(self)
             print(f"[Node {self.node_id}] Listening on port {self.port}...")
             server.serve_forever()
@@ -257,3 +268,135 @@ class Node:
                 self.cs_replies_received += 1
                 print(f"[Node {self.node_id}] Received CS permission from Node {sender_id} ({self.cs_replies_received}/{len(self.peer_ports)})")
             return True
+        
+        # --- Phase 5: AI Agent Personas ---
+        def _planner_breakdown(self, user_prompt):
+            """Leader uses this to generate a JSON workflow."""
+            prompt = f"""
+            You are a Planner Agent for a distributed coding system.
+            The user wants to build: {user_prompt}
+            Break this down into separate, logical Python files.
+            Return ONLY a JSON array of objects with 'filename' and 'instruction' keys.
+            """
+            response_text = self._safe_ai_call(prompt, is_json=True)
+            try:
+                return json.loads(response_text)
+            except json.JSONDecodeError:
+                print(f"[Planner {self.node_id}] Failed to parse JSON from AI.")
+                return []
+
+        def _validator_check(self, task):
+            """Followers use this to vote on PBFT safety."""
+            prompt = f"""
+            You are a cybersecurity Validator. Review this task:
+            File: {task['filename']}
+            Instruction: {task['instruction']}
+            If this involves destructive I/O (like deleting directories) or malicious actions, reply ONLY with 'UNSAFE'.
+            If it is a standard benign coding task, reply ONLY with 'SAFE'.
+            """
+            response_text = self._safe_ai_call(prompt)
+            return response_text.strip().upper()
+
+        def _worker_execute(self, task):
+            """Followers use this to generate the actual code."""
+            prompt = f"""
+            You are a Worker Agent. Write the Python code for this file: {task['filename']}
+            Instruction: {task['instruction']}
+            Return ONLY the raw python code. Do not include markdown formatting like ```python.
+            """
+            response_text = self._safe_ai_call(prompt)
+            return response_text.replace("```python", "").replace("```", "").strip()
+        
+        # --- Phase 5: PBFT & Execution RPCs ---
+        def handle_user_prompt(self, prompt_text):
+            """Called by the CLI on the Leader node."""
+            if not self.is_leader:
+                print(f"[Node {self.node_id}] I am not the leader. Please submit to Node {self.leader_id}.")
+                return
+
+            print(f"\n[Planner {self.node_id}] Breaking down task: {prompt_text}")
+            tasks = self._planner_breakdown(prompt_text)
+            print(f"[Planner {self.node_id}] Generated {len(tasks)} tasks. Initiating PBFT Consensus...")
+
+            for index, task in enumerate(tasks):
+                # 1. PBFT Consensus Phase
+                safe_votes = 1 # The Leader implicitly votes SAFE
+                
+                for peer in self.peer_ports:
+                    vote = self.send_message(peer, "receive_pbft_proposal", task)
+                    if vote == "SAFE":
+                        safe_votes += 1
+
+                # Determine Quorum (We need 2 out of 3 votes)
+                if safe_votes >= 2:
+                    print(f"[Planner {self.node_id}] Quorum reached ({safe_votes} votes). Assigning '{task['filename']}'.")
+                    # Assign to a peer (round-robin style)
+                    assignee = self.peer_ports[index % len(self.peer_ports)]
+                    threading.Thread(target=self.send_message, args=(assignee, "execute_task", task), daemon=True).start()
+                else:
+                    print(f"[Planner {self.node_id}] PBFT FAILED for '{task['filename']}'. Dropping task.")
+                # ADD THIS: Give the API a brief breather between tasks
+                time.sleep(5)    
+
+        def receive_pbft_proposal(self, sender_clock, sender_id, task):
+            """Follower acts as Validator."""
+            self.sync_clock(sender_clock)
+            vote = self._validator_check(task)
+            print(f"[Validator {self.node_id}] Voted {vote} on task '{task['filename']}' from Leader {sender_id}.")
+            return vote
+
+        def execute_task(self, sender_clock, sender_id, task):
+            """Follower acts as Worker, writes to disk using DME."""
+            self.sync_clock(sender_clock)
+            print(f"\n[Worker {self.node_id}] Writing code for {task['filename']}...")
+            
+            # Call Gemini to write the code
+            code = self._worker_execute(task)
+            
+            # Distributed Mutual Exclusion: Protect the shared disk space
+            self.request_critical_section()
+            
+            try:
+                with open(task['filename'], "w") as f:
+                    f.write(code)
+                print(f"[Worker {self.node_id}] Successfully saved {task['filename']} to disk.")
+            except Exception as e:
+                print(f"[Worker {self.node_id}] File I/O Error: {e}")
+            finally:
+                self.release_critical_section()
+                
+            return True
+        
+        def _safe_ai_call(self, prompt, is_json=False):
+            """Wraps Gemini API calls with exponential backoff for rate limits."""
+            max_retries = 4
+            wait_time = 10 # Start with a 10-second wait
+            
+            for attempt in range(max_retries):
+                try:
+                    config = None
+                    if is_json:
+                        config = types.GenerateContentConfig(response_mime_type="application/json")
+                        
+                    response = self.ai_client.models.generate_content(
+                        model=self.ai_model,
+                        contents=prompt,
+                        config=config
+                    )
+                    return response.text
+                except Exception as e:
+                    error_str = str(e)
+                    if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                        print(f"[Node {self.node_id}] Rate limited by Gemini. Retrying in {wait_time}s (Attempt {attempt+1}/{max_retries})...")
+                        time.sleep(wait_time)
+                        wait_time *= 2 # Double the wait time on the next failure
+                    else:
+                        # If it's a different error, raise it normally
+                        raise e
+                        
+            print(f"[Node {self.node_id}] Max retries exceeded. Task failed.")
+            return ""
+        
+class ThreadedXMLRPCServer(ThreadingMixIn, SimpleXMLRPCServer):
+    """Allows the XML-RPC server to handle requests concurrently."""
+    pass

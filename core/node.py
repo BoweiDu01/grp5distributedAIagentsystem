@@ -41,7 +41,7 @@ class Node:
             # Phase 5: AI Integration
             try:
                 self.ai_client = genai.Client()
-                self.ai_model = 'gemini-2.5-flash'
+                self.ai_model = 'gemini-2.5-flash-lite'
             except Exception as e:
                 print(f"[Node {self.node_id}] Warning: AI client failed to initialize. {e}")
 
@@ -99,7 +99,13 @@ class Node:
             while True:
                 if self.is_leader:
                     for peer in self.peer_ports:
-                        self.send_message(peer, "receive_heartbeat")
+                        # FIRE AND FORGET: Spawns a micro-thread for each heartbeat
+                        # so a slow peer doesn't block the next peer's heartbeat.
+                        threading.Thread(
+                            target=self.send_message, 
+                            args=(peer, "receive_heartbeat"),
+                            daemon=True
+                        ).start()
                 time.sleep(2) # Send a heartbeat every 2 seconds
 
         def _monitor_leader(self):
@@ -277,6 +283,7 @@ class Node:
             The user wants to build: {user_prompt}
             Break this down into separate, logical Python files.
             Return ONLY a JSON array of objects with 'filename' and 'instruction' keys.
+            Create a ReadMe.md file with setup instructions.
             """
             response_text = self._safe_ai_call(prompt, is_json=True)
             try:
@@ -357,9 +364,22 @@ class Node:
             self.request_critical_section()
             
             try:
-                with open(task['filename'], "w") as f:
+                # 1. Define the isolated workspace folder
+                workspace_dir = "ai_workspace"
+                
+                # 2. Safely create the directory (exist_ok=True prevents crashes if it already exists)
+                os.makedirs(workspace_dir, exist_ok=True)
+                
+                # 3. Sanitize the filename to prevent the AI from generating paths like "../main.py"
+                safe_filename = os.path.basename(task['filename'])
+                filepath = os.path.join(workspace_dir, safe_filename)
+                
+                # 4. Write the file to the protected directory
+                with open(filepath, "w") as f:
                     f.write(code)
-                print(f"[Worker {self.node_id}] Successfully saved {task['filename']} to disk.")
+                    
+                print(f"[Worker {self.node_id}] Successfully saved {safe_filename} into ./{workspace_dir}/")
+                
             except Exception as e:
                 print(f"[Worker {self.node_id}] File I/O Error: {e}")
             finally:

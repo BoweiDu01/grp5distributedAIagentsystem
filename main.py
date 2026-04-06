@@ -18,7 +18,7 @@ def main():
     # Let the server spin up
     time.sleep(1)
 
-    # Simple CLI loop to test sending messages
+    # Simple CLI loop to test commands
     while True:
         try:
             cmd = input(f"\n[Node {my_id}] Type 'ping' or 'write' (or 'exit'): \n")
@@ -32,13 +32,14 @@ def main():
             elif cmd.lower() == 'write':
                 # Trigger Ricart-Agrawala
                 node.request_critical_section()
-                
-                # Simulate the AI taking 5 seconds to write to a file
                 print("Writing to shared file... (simulating 5 seconds)")
                 time.sleep(5)
-                
-                # Release the lock so others can use it
                 node.release_critical_section()
+                
+            # --- PHASE 5 AI INTEGRATION ---
+            elif cmd.lower().startswith('prompt '):
+                user_prompt = cmd[7:] # Extract the text after "prompt "
+                node.handle_user_prompt(user_prompt)
                 
         except KeyboardInterrupt:
             break

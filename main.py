@@ -21,7 +21,9 @@ def main():
     # Simple CLI loop to test commands
     while True:
         try:
-            cmd = input(f"\n[Node {my_id}] Type 'ping' or 'write' (or 'exit'): \n")
+            cmd = input(
+                f"\n[Node {my_id}] Commands: ping | write | afs_write <file> <text> | afs_read <file> | afs_status | prompt <text> | exit\n"
+            )
             if cmd.lower() == 'exit':
                 break
             
@@ -35,6 +37,25 @@ def main():
                 print("Writing to shared file... (simulating 5 seconds)")
                 time.sleep(5)
                 node.release_critical_section()
+
+            elif cmd.lower().startswith('afs_write '):
+                parts = cmd.split(' ', 2)
+                if len(parts) < 3:
+                    print("Usage: afs_write <filename> <content>")
+                else:
+                    node.afs_write(parts[1], parts[2])
+
+            elif cmd.lower().startswith('afs_read '):
+                parts = cmd.split(' ', 1)
+                if len(parts) < 2 or not parts[1].strip():
+                    print("Usage: afs_read <filename>")
+                else:
+                    content = node.afs_read(parts[1].strip())
+                    if content is not None:
+                        print(f"AFS Content:\n{content}")
+
+            elif cmd.lower() == 'afs_status':
+                node.afs_status()
                 
             # --- PHASE 5 AI INTEGRATION ---
             elif cmd.lower().startswith('prompt '):

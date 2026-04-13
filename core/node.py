@@ -5,8 +5,14 @@ import xmlrpc.client
 import time
 import json
 import os
+import hashlib
 from google import genai
 from google.genai import types
+
+try:
+    from dotenv import load_dotenv
+except Exception:
+    load_dotenv = None
 
 class Node:
         def __init__(self, node_id, port, peer_ports):
@@ -38,12 +44,34 @@ class Node:
             self.cs_replies_received = 0
             self.deferred_requests = []
             self.cs_lock = threading.Lock() # Protects DME state from race conditions
+
+            # AFS-lite state: replicated storage + client cache
+            self.afs_lock = threading.Lock()
+            self.afs_cache = {}
+            self.afs_index = {}
+            self.replication_factor = min(3, len(self.peer_ports) + 1)
+            self.afs_storage_dir = os.path.join("afs_storage", f"node_{self.port}")
+            os.makedirs(self.afs_storage_dir, exist_ok=True)
+
             # Phase 5: AI Integration
+            self._load_env()
             try:
+                if not os.getenv("GEMINI_API_KEY"):
+                    raise ValueError("GEMINI_API_KEY is not set.")
                 self.ai_client = genai.Client()
-                self.ai_model = 'gemini-2.5-flash-lite'
+                self.ai_model = 'gemini-3-flash-preview'
             except Exception as e:
                 print(f"[Node {self.node_id}] Warning: AI client failed to initialize. {e}")
+
+        def _load_env(self):
+            """Loads environment variables from a local .env file if available."""
+            if load_dotenv is None:
+                print(f"[Node {self.node_id}] Warning: python-dotenv not installed; skipping .env load.")
+                return
+
+            dotenv_path = os.path.join(os.getcwd(), ".env")
+            if os.path.exists(dotenv_path):
+                load_dotenv(dotenv_path=dotenv_path)
 
         def _start_server(self):
             """Phase 1: Initialize the XML-RPC server to listen for incoming messages."""
@@ -273,6 +301,203 @@ class Node:
             with self.cs_lock:
                 self.cs_replies_received += 1
                 print(f"[Node {self.node_id}] Received CS permission from Node {sender_id} ({self.cs_replies_received}/{len(self.peer_ports)})")
+            return True
+
+        # --- AFS-lite: Fault-tolerant replicated file storage ---
+
+        def _sanitize_afs_filename(self, filename):
+            return os.path.basename(filename.strip())
+
+        def _replica_path(self, filename):
+            safe_name = self._sanitize_afs_filename(filename)
+            return os.path.join(self.afs_storage_dir, f"{safe_name}.afs.json")
+
+        def _all_node_ports(self):
+            return sorted([self.port] + self.peer_ports)
+
+        def _replica_ports(self, filename):
+            all_ports = self._all_node_ports()
+            if not all_ports:
+                return []
+
+            total = min(self.replication_factor, len(all_ports))
+            digest = hashlib.sha256(filename.encode("utf-8")).hexdigest()
+            start_index = int(digest, 16) % len(all_ports)
+            ports = []
+            for i in range(total):
+                ports.append(all_ports[(start_index + i) % len(all_ports)])
+            return ports
+
+        def _local_store_replica(self, filename, content, version):
+            safe_name = self._sanitize_afs_filename(filename)
+            payload = {
+                "filename": safe_name,
+                "version": int(version),
+                "content": content,
+                "updated_at": time.time(),
+            }
+
+            path = self._replica_path(safe_name)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+
+            with self.afs_lock:
+                self.afs_index[safe_name] = {
+                    "version": int(version),
+                    "replicas": self._replica_ports(safe_name),
+                    "updated_at": payload["updated_at"],
+                }
+                self.afs_cache[safe_name] = {
+                    "version": int(version),
+                    "content": content,
+                }
+
+        def _local_fetch_replica(self, filename):
+            safe_name = self._sanitize_afs_filename(filename)
+            path = self._replica_path(safe_name)
+            if not os.path.exists(path):
+                return {"ok": False}
+
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+                return {
+                    "ok": True,
+                    "filename": safe_name,
+                    "version": int(payload.get("version", 0)),
+                    "content": payload.get("content", ""),
+                }
+            except Exception:
+                return {"ok": False}
+
+        def afs_write(self, filename, content):
+            """Client entrypoint: quorum write with replication and invalidation."""
+            safe_name = self._sanitize_afs_filename(filename)
+            if not safe_name:
+                print(f"[Node {self.node_id}] Invalid filename.")
+                return False
+
+            replicas = self._replica_ports(safe_name)
+            if not replicas:
+                print(f"[Node {self.node_id}] No replicas available for write.")
+                return False
+
+            self.request_critical_section()
+            success = False
+            try:
+                latest = self._read_latest_record(safe_name)
+                new_version = latest["version"] + 1 if latest else 1
+
+                required_acks = (len(replicas) // 2) + 1
+                ack_count = 0
+
+                for peer in replicas:
+                    if peer == self.port:
+                        self._local_store_replica(safe_name, content, new_version)
+                        ack_count += 1
+                    else:
+                        ack = self.send_message(peer, "receive_afs_store_replica", safe_name, content, new_version)
+                        if ack:
+                            ack_count += 1
+
+                if ack_count >= required_acks:
+                    for peer in self.peer_ports:
+                        self.send_message(peer, "receive_afs_invalidate", safe_name, new_version)
+                    print(f"[Node {self.node_id}] AFS write committed: {safe_name} v{new_version} ({ack_count}/{len(replicas)} acks)")
+                    success = True
+                else:
+                    print(f"[Node {self.node_id}] AFS write failed quorum: {safe_name} ({ack_count}/{len(replicas)} acks)")
+            finally:
+                self.release_critical_section()
+
+            return success
+
+        def afs_read(self, filename):
+            """Client entrypoint: read latest version from replicas and repair stale copies."""
+            safe_name = self._sanitize_afs_filename(filename)
+            if not safe_name:
+                print(f"[Node {self.node_id}] Invalid filename.")
+                return None
+
+            latest = self._read_latest_record(safe_name)
+            if not latest:
+                print(f"[Node {self.node_id}] AFS read miss: {safe_name}")
+                return None
+
+            # Best-effort read repair for missing or stale replicas.
+            replicas = self._replica_ports(safe_name)
+            for peer in replicas:
+                if peer == self.port:
+                    local = self._local_fetch_replica(safe_name)
+                    if (not local.get("ok")) or int(local.get("version", 0)) < latest["version"]:
+                        self._local_store_replica(safe_name, latest["content"], latest["version"])
+                else:
+                    self.send_message(peer, "receive_afs_store_replica", safe_name, latest["content"], latest["version"])
+
+            with self.afs_lock:
+                self.afs_cache[safe_name] = {
+                    "version": latest["version"],
+                    "content": latest["content"],
+                }
+
+            print(f"[Node {self.node_id}] AFS read: {safe_name} v{latest['version']}")
+            return latest["content"]
+
+        def _read_latest_record(self, filename):
+            replicas = self._replica_ports(filename)
+            candidates = []
+
+            for peer in replicas:
+                if peer == self.port:
+                    data = self._local_fetch_replica(filename)
+                else:
+                    data = self.send_message(peer, "receive_afs_fetch", filename)
+
+                if data and isinstance(data, dict) and data.get("ok"):
+                    candidates.append(data)
+
+            if not candidates:
+                return None
+
+            return max(candidates, key=lambda item: int(item.get("version", 0)))
+
+        def afs_status(self):
+            with self.afs_lock:
+                print(f"\n[Node {self.node_id}] AFS status")
+                print(f"- Local storage: {self.afs_storage_dir}")
+                print(f"- Replication factor: {self.replication_factor}")
+                print(f"- Cached files: {len(self.afs_cache)}")
+                print(f"- Indexed files: {len(self.afs_index)}")
+                for name, meta in self.afs_index.items():
+                    print(f"  * {name} v{meta['version']} replicas={meta['replicas']}")
+
+        def receive_afs_store_replica(self, sender_clock, sender_id, filename, content, version):
+            self.sync_clock(sender_clock)
+            safe_name = self._sanitize_afs_filename(filename)
+            current = self._local_fetch_replica(safe_name)
+            if current.get("ok") and int(current.get("version", 0)) > int(version):
+                return True
+
+            self._local_store_replica(safe_name, content, int(version))
+            print(f"[Node {self.node_id}] Stored replica {safe_name} v{version} from Node {sender_id}")
+            return True
+
+        def receive_afs_fetch(self, sender_clock, sender_id, filename):
+            self.sync_clock(sender_clock)
+            safe_name = self._sanitize_afs_filename(filename)
+            return self._local_fetch_replica(safe_name)
+
+        def receive_afs_invalidate(self, sender_clock, sender_id, filename, version):
+            self.sync_clock(sender_clock)
+            safe_name = self._sanitize_afs_filename(filename)
+            with self.afs_lock:
+                cache_entry = self.afs_cache.get(safe_name)
+                if cache_entry and int(cache_entry.get("version", 0)) < int(version):
+                    self.afs_cache.pop(safe_name, None)
+
+                idx = self.afs_index.get(safe_name)
+                if idx and int(idx.get("version", 0)) < int(version):
+                    idx["version"] = int(version)
             return True
         
         # --- Phase 5: AI Agent Personas ---

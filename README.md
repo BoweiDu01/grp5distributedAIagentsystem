@@ -8,6 +8,7 @@ This project is a decentralized framework built from scratch in Python. It simul
 * **Phase 3: Leader Election** (Bully Algorithm)
 * **Phase 4: Distributed Mutual Exclusion** (Ricart-Agrawala Algorithm)
 * **Phase 5: AI-Powered Code Generation** (PBFT Consensus with Gemini AI)
+* **Phase 6: AFS-lite Fault-Tolerant File Storage** (Replicated files with quorum semantics)
 
 ## Prerequisites
 * Python 3.8+
@@ -45,3 +46,47 @@ To simulate the distributed network locally, you must spin up multiple nodes in 
 ### 4. Test AI-Powered Code Generation (PBFT Consensus)
 * Go to the Leader node's terminal (e.g., Node 5003) and type `prompt <description>`, e.g., `prompt create a simple tic-tac-toe game`.
 * **Expected Result:** The Leader (Planner) breaks down the task into files. Followers (Validators) vote on safety using PBFT consensus. If approved, Workers generate code via Gemini AI and write files to the `ai_workspace/` directory using distributed mutual exclusion to prevent conflicts.
+
+### 5. Test AFS-lite Fault-Tolerant File Storage
+
+The cluster now supports a lightweight Andrew File System style layer with replication and versioned reads/writes.
+
+#### Available Commands
+* `afs_write <filename> <content>`: Writes a new version of a file to replicated nodes.
+* `afs_read <filename>`: Reads the latest version across replicas and performs best-effort repair of stale copies.
+* `afs_status`: Shows local AFS index/cache state for the current node.
+
+#### Basic Write/Read Test
+1. Start the same 3-node cluster:
+	* Terminal 1: `python main.py 5001 5002 5003`
+	* Terminal 2: `python main.py 5002 5001 5003`
+	* Terminal 3: `python main.py 5003 5001 5002`
+2. In any terminal, write a file:
+	* `afs_write notes.txt hello from node`
+3. In another node terminal, read it:
+	* `afs_read notes.txt`
+4. **Expected Result:** You should see `AFS read: notes.txt v1` and the same content returned from a different node.
+
+#### Versioning Test
+1. Run a second write from any node:
+	* `afs_write notes.txt updated content`
+2. Read from all nodes using `afs_read notes.txt`.
+3. **Expected Result:** All reads converge to the newest version (for example `v2`).
+
+#### Failure Tolerance Test (Replica Node Down)
+1. Write a file first:
+	* `afs_write report.txt initial draft`
+2. Stop one node (Ctrl + C in one terminal).
+3. From a surviving node, run:
+	* `afs_read report.txt`
+4. **Expected Result:** Read still succeeds as long as quorum/replicas are still reachable.
+
+#### Recovery/Repair Test
+1. Restart the stopped node using its original command.
+2. From a live node, run:
+	* `afs_read report.txt`
+3. **Expected Result:** During read, replicas are refreshed best-effort, and subsequent reads on the restarted node return the latest version.
+
+#### Local Storage Layout
+* Replicas are stored per node in `afs_storage/node_<port>/`.
+* Each replicated object is saved as `<filename>.afs.json` with `version` and `content` fields.

@@ -1,3 +1,22 @@
+# Secrets and local env files
 .env
-.venv
-/ai_workspace
+.env.*
+
+# Virtual environments
+.venv/
+venv/
+
+# Python cache/bytecode
+core/__pycache__/
+__pycache__/
+*.py[cod]
+
+# Runtime/generated project artifacts
+ai_workspace/
+afs_storage/
+
+# Tool/editor/system files
+.DS_Store
+.pytest_cache/
+
+.vscode/

@@ -67,7 +67,7 @@ class Node:
                 if not os.getenv("GEMINI_API_KEY"):
                     raise ValueError("GEMINI_API_KEY is not set.")
                 self.ai_client = genai.Client()
-                self.ai_model = 'gemini-3-flash-preview'
+                self.ai_model = 'gemini-2.5-flash'
             except Exception as e:
                 print(f"[Node {self.node_id}] Warning: AI client failed to initialize. {e}")
 
@@ -614,6 +614,27 @@ class Node:
             """
             response_text = self._safe_ai_call(prompt)
             return response_text.replace("```python", "").replace("```", "").strip()
+
+        def _afs_key_for_ai_file(self, filename):
+            """Build a stable AFS key for generated files."""
+            raw_name = str(filename or "generated.py")
+            digest = hashlib.sha256(raw_name.encode("utf-8")).hexdigest()[:12]
+            safe_tail = os.path.basename(raw_name).strip() or "generated.py"
+            return f"ai_{digest}_{safe_tail}"
+
+        def _safe_ai_workspace_path(self, filename):
+            """Map generated names into ai_workspace while preventing path traversal."""
+            raw_name = str(filename or "generated.py").replace("\\", "/").strip()
+            normalized = os.path.normpath(raw_name)
+
+            if normalized.startswith("../") or normalized == ".." or os.path.isabs(normalized):
+                normalized = os.path.basename(normalized)
+
+            parts = [p for p in normalized.split("/") if p not in ("", ".", "..")]
+            if not parts:
+                parts = ["generated.py"]
+
+            return os.path.join("ai_workspace", *parts)
         
         def _local_security_scan(self, task):
             """
@@ -672,37 +693,39 @@ class Node:
                 time.sleep(2)
 
         def execute_task(self, sender_clock, sender_id, task):
-            """Follower acts as Worker, writes to disk using DME."""
+            """Follower acts as Worker, commits via AFS, then mirrors locally."""
             self.sync_clock(sender_clock)
-            print(f"\n[Worker {self.node_id}] Writing code for {task['filename']}...")
+            target_name = task.get('filename', 'generated.py')
+            print(f"\n[Worker {self.node_id}] Writing code for {target_name}...")
             
             # Call Gemini to write the code
             code = self._worker_execute(task)
-            
-            # Distributed Mutual Exclusion: Protect the shared disk space
-            self.request_critical_section()
-            
+
             try:
-                # 1. Define the isolated workspace folder
-                workspace_dir = "ai_workspace"
-                
-                # 2. Safely create the directory (exist_ok=True prevents crashes if it already exists)
-                os.makedirs(workspace_dir, exist_ok=True)
-                
-                # 3. Sanitize the filename to prevent the AI from generating paths like "../main.py"
-                safe_filename = os.path.basename(task['filename'])
-                filepath = os.path.join(workspace_dir, safe_filename)
-                
-                # 4. Write the file to the protected directory
-                with open(filepath, "w") as f:
-                    f.write(code)
-                    
-                print(f"[Worker {self.node_id}] Successfully saved {safe_filename} into ./{workspace_dir}/")
+                afs_key = self._afs_key_for_ai_file(target_name)
+                committed = self.afs_write(afs_key, code)
+                if not committed:
+                    print(f"[Worker {self.node_id}] AFS commit failed for {target_name}.")
+                    return False
+
+                latest_code = self.afs_read(afs_key)
+                if latest_code is None:
+                    latest_code = code
+
+                local_path = self._safe_ai_workspace_path(target_name)
+                # Keep DME for local materialization as requested.
+                self.request_critical_section()
+                try:
+                    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                    with open(local_path, "w", encoding="utf-8") as f:
+                        f.write(latest_code)
+                finally:
+                    self.release_critical_section()
+
+                print(f"[Worker {self.node_id}] AFS committed as '{afs_key}', mirrored to ./{local_path}")
                 
             except Exception as e:
                 print(f"[Worker {self.node_id}] File I/O Error: {e}")
-            finally:
-                self.release_critical_section()
                 
             return True
         

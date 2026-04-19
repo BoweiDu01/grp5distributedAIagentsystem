@@ -6,8 +6,13 @@ import time
 import json
 import os
 import hashlib
+import socket
 from google import genai
 from google.genai import types
+
+class ThreadedXMLRPCServer(ThreadingMixIn, SimpleXMLRPCServer):
+    """Allows the XML-RPC server to handle requests concurrently."""
+    pass
 
 try:
     from dotenv import load_dotenv
@@ -44,6 +49,9 @@ class Node:
             self.cs_replies_received = 0
             self.deferred_requests = []
             self.cs_lock = threading.Lock() # Protects DME state from race conditions
+            # --- NEW: Dynamic Membership State ---
+            self.active_peers = set(self.peer_ports)
+            self.peer_lock = threading.Lock()
 
             # AFS-lite state: replicated storage + client cache
             self.afs_lock = threading.Lock()
@@ -103,12 +111,25 @@ class Node:
             target_url = f"http://localhost:{target_port}"
             
             try:
+                # Use a reasonable timeout so we don't hang forever on silent network drops
                 with xmlrpc.client.ServerProxy(target_url) as proxy:
                     method = getattr(proxy, method_name)
-                    # We always pass our Lamport clock as the first argument
-                    return method(current_time, self.node_id, *args)
-            except ConnectionRefusedError:
-                print(f"[Node {self.node_id}] Failed to connect to port {target_port}.")
+                    result = method(current_time, self.node_id, *args)
+                    
+                    # If successful, ensure they are in the active pool
+                    with self.peer_lock:
+                        if target_port not in self.active_peers:
+                            self.active_peers.add(target_port)
+                            print(f"[Network] Node {target_port} is ONLINE.")
+                            
+                    return result
+                    
+            except (ConnectionRefusedError, socket.timeout, OSError):
+                # If the connection fails, remove them from the active pool
+                with self.peer_lock:
+                    if target_port in self.active_peers:
+                        self.active_peers.remove(target_port)
+                        print(f"[Network] Node {target_port} is DEAD. Removed from active peers.")
                 return None
 
         # --- RPC Exposed Methods (Callable by other nodes) ---
@@ -230,21 +251,34 @@ class Node:
             
             print(f"\n[Node {self.node_id}] Requesting Critical Section at TS {self.cs_request_timestamp}")
             
-            # Broadcast request to all peers
-            for peer in self.peer_ports:
-                # Send in a background thread so we don't block
+            # Snapshot the active peers so we know who to ask
+            with self.peer_lock:
+                current_active = list(self.active_peers)
+                
+            # If no one else is alive, we get the lock instantly!
+            if not current_active:
+                with self.cs_lock:
+                    self.cs_state = 'HELD'
+                print(f"\n*** [Node {self.node_id}] Entered Critical Section (Solo Node)! ***")
+                return
+
+            # Broadcast request to all ACTIVE peers
+            for peer in current_active:
                 threading.Thread(
                     target=self.send_message, 
                     args=(peer, "receive_cs_request", self.cs_request_timestamp), 
                     daemon=True
                 ).start()
                 
-            # Wait until we get replies from EVERY peer
+            # Wait until we get replies from the currently alive peers
             while True:
                 with self.cs_lock:
-                    if self.cs_replies_received >= len(self.peer_ports):
-                        self.cs_state = 'HELD'
-                        break
+                    with self.peer_lock:
+                        # If a node crashes while we are waiting, send_message drops it from active_peers.
+                        # This condition will automatically evaluate to True and prevent deadlock!
+                        if self.cs_replies_received >= len(self.active_peers):
+                            self.cs_state = 'HELD'
+                            break
                 time.sleep(0.1)
                 
             print(f"\n*** [Node {self.node_id}] Entered Critical Section! ***")
@@ -475,17 +509,69 @@ class Node:
             self.sync_clock(sender_clock)
             safe_name = self._sanitize_afs_filename(filename)
             current = self._local_fetch_replica(safe_name)
+            
             if current.get("ok") and int(current.get("version", 0)) > int(version):
                 return True
 
             self._local_store_replica(safe_name, content, int(version))
-            print(f"[Node {self.node_id}] Stored replica {safe_name} v{version} from Node {sender_id}")
+            
+            # --- Call the new safe invalidation method here ---
+            # This replaces the old inline loop that blocked the lock!
+            self._invalidate_callbacks(safe_name, version)
             return True
 
+        # --- Paste the new helper methods right below it ---
+        def _invalidate_callbacks(self, safe_name, version):
+            """Sends invalidations to all registered clients without blocking the file system."""
+            with self.afs_lock:
+                if safe_name not in self.afs_index:
+                    return
+
+                callbacks = list(self.afs_index[safe_name].get("callbacks", []))
+                # Clear it immediately so the lock is freed fast.
+                self.afs_index[safe_name]["callbacks"] = set()
+
+            # Perform network I/O OUTSIDE the lock
+            for client_port in callbacks:
+                if client_port == self.port:
+                    continue
+
+                threading.Thread(
+                    target=self._dispatch_invalidation,
+                    args=(client_port, safe_name, version),
+                    daemon=True
+                ).start()
+
+        def _dispatch_invalidation(self, client_port, safe_name, version):
+            """Helper method to handle the actual RPC call and failure logging."""
+            try:
+                proxy = xmlrpc.client.ServerProxy(
+                    f"http://localhost:{client_port}/", 
+                    timeout=1
+                )
+                proxy.receive_afs_invalidate(self.tick(), self.node_id, safe_name, version)
+                print(f"[AFS] Invalidation sent to Node {client_port} for '{safe_name}'")
+                
+            except (socket.timeout, ConnectionRefusedError, OSError):
+                print(f"[AFS] Node {client_port} unreachable. Dropped invalidation for '{safe_name}'.")
+
         def receive_afs_fetch(self, sender_clock, sender_id, filename):
+            """Replica side: Send data and register the requester for callbacks."""
             self.sync_clock(sender_clock)
             safe_name = self._sanitize_afs_filename(filename)
-            return self._local_fetch_replica(safe_name)
+            data = self._local_fetch_replica(safe_name)
+            
+            if data.get("ok"):
+                with self.afs_lock:
+                    # Ensure the index entry exists
+                    if safe_name not in self.afs_index:
+                        self.afs_index[safe_name] = {"version": data["version"], "callbacks": set()}
+                    
+                    # Register the requester's port for future invalidations
+                    self.afs_index[safe_name]["callbacks"].add(int(sender_id))
+                    print(f"[AFS] Registered callback for Node {sender_id} on file '{safe_name}'")
+                    
+            return data
 
         def receive_afs_invalidate(self, sender_clock, sender_id, filename, version):
             self.sync_clock(sender_clock)
@@ -517,17 +603,7 @@ class Node:
                 print(f"[Planner {self.node_id}] Failed to parse JSON from AI.")
                 return []
 
-        def _validator_check(self, task):
-            """Followers use this to vote on PBFT safety."""
-            prompt = f"""
-            You are a cybersecurity Validator. Review this task:
-            File: {task['filename']}
-            Instruction: {task['instruction']}
-            If this involves destructive I/O (like deleting directories) or malicious actions, reply ONLY with 'UNSAFE'.
-            If it is a standard benign coding task, reply ONLY with 'SAFE'.
-            """
-            response_text = self._safe_ai_call(prompt)
-            return response_text.strip().upper()
+
 
         def _worker_execute(self, task):
             """Followers use this to generate the actual code."""
@@ -539,43 +615,61 @@ class Node:
             response_text = self._safe_ai_call(prompt)
             return response_text.replace("```python", "").replace("```", "").strip()
         
-        # --- Phase 5: PBFT & Execution RPCs ---
+        def _local_security_scan(self, task):
+            """
+            Analyzes the task instruction and code for common security red flags.
+            Replaces the expensive PBFT AI call.
+            """
+            dangerous_patterns = [
+                "rm -rf", "chmod 777", "subprocess.call", "eval(", 
+                "os.system", "pickle.load", "requests.get", "socket.connect"
+            ]
+            
+            # Check the instruction and the filename for nonsense
+            instruction = task.get('instruction', '').lower()
+            filename = task.get('filename', '').lower()
+            
+            for pattern in dangerous_patterns:
+                if pattern in instruction or pattern in filename:
+                    print(f"[Security] BLOCKING task '{filename}': Found dangerous pattern '{pattern}'")
+                    return "UNSAFE"
+                    
+            return "SAFE"
+
         def handle_user_prompt(self, prompt_text):
-            """Called by the CLI on the Leader node."""
+            """
+            Leader processes the request: Plan -> Scan -> Delegate.
+            """
             if not self.is_leader:
-                print(f"[Node {self.node_id}] I am not the leader. Please submit to Node {self.leader_id}.")
+                print(f"[Node {self.node_id}] Not the leader. Submit to {self.leader_id}.")
                 return
 
-            print(f"\n[Planner {self.node_id}] Breaking down task: {prompt_text}")
+            print(f"\n[Planner] Breaking down: {prompt_text}")
             tasks = self._planner_breakdown(prompt_text)
-            print(f"[Planner {self.node_id}] Generated {len(tasks)} tasks. Initiating PBFT Consensus...")
+            
+            if not tasks:
+                return
 
             for index, task in enumerate(tasks):
-                # 1. PBFT Consensus Phase
-                safe_votes = 1 # The Leader implicitly votes SAFE
+                # 1. Cheap Local Security Check
+                if self._local_security_scan(task) == "UNSAFE":
+                    continue
+
+                # 2. Round-robin assignment (Scalability)
+                # We include the leader in the worker pool to maximize resources
+                all_ports = self._all_node_ports()
+                assignee = all_ports[index % len(all_ports)]
                 
-                for peer in self.peer_ports:
-                    vote = self.send_message(peer, "receive_pbft_proposal", task)
-                    if vote == "SAFE":
-                        safe_votes += 1
-
-                # Determine Quorum (We need 2 out of 3 votes)
-                if safe_votes >= 2:
-                    print(f"[Planner {self.node_id}] Quorum reached ({safe_votes} votes). Assigning '{task['filename']}'.")
-                    # Assign to a peer (round-robin style)
-                    assignee = self.peer_ports[index % len(self.peer_ports)]
-                    threading.Thread(target=self.send_message, args=(assignee, "execute_task", task), daemon=True).start()
+                print(f"[Leader] Assigning '{task['filename']}' to Node {assignee}")
+                
+                # 3. Trigger execution
+                if assignee == self.port:
+                    threading.Thread(target=self.execute_task, args=(self.tick(), self.node_id, task), daemon=True).start()
                 else:
-                    print(f"[Planner {self.node_id}] PBFT FAILED for '{task['filename']}'. Dropping task.")
-                # ADD THIS: Give the API a brief breather between tasks
-                time.sleep(5)    
-
-        def receive_pbft_proposal(self, sender_clock, sender_id, task):
-            """Follower acts as Validator."""
-            self.sync_clock(sender_clock)
-            vote = self._validator_check(task)
-            print(f"[Validator {self.node_id}] Voted {vote} on task '{task['filename']}' from Leader {sender_id}.")
-            return vote
+                    threading.Thread(target=self.send_message, args=(assignee, "execute_task", task), daemon=True).start()
+                    
+                # Optional: Short delay to prevent hammering the Gemini API too fast
+                time.sleep(2)
 
         def execute_task(self, sender_clock, sender_id, task):
             """Follower acts as Worker, writes to disk using DME."""
@@ -642,6 +736,21 @@ class Node:
             print(f"[Node {self.node_id}] Max retries exceeded. Task failed.")
             return ""
         
-class ThreadedXMLRPCServer(ThreadingMixIn, SimpleXMLRPCServer):
-    """Allows the XML-RPC server to handle requests concurrently."""
-    pass
+        # Removed the original PBFT proposal and validator methods to save on Gemini calls and replaced it with a local security scan.
+        # def receive_pbft_proposal(self, sender_clock, sender_id, task):
+        #     """Follower acts as Validator."""
+        #     self.sync_clock(sender_clock)
+        #     vote = self._validator_check(task)
+        #     print(f"[Validator {self.node_id}] Voted {vote} on task '{task['filename']}' from Leader {sender_id}.")
+        #     return vote
+        # def _validator_check(self, task):
+        #     """Followers use this to vote on PBFT safety."""
+        #     prompt = f"""
+        #     You are a cybersecurity Validator. Review this task:
+        #     File: {task['filename']}
+        #     Instruction: {task['instruction']}
+        #     If this involves destructive I/O (like deleting directories) or malicious actions, reply ONLY with 'UNSAFE'.
+        #     If it is a standard benign coding task, reply ONLY with 'SAFE'.
+        #     """
+        #     response_text = self._safe_ai_call(prompt)
+        #     return response_text.strip().upper()

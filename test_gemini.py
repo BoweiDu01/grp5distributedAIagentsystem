@@ -20,7 +20,7 @@ def test_api():
 
         print("Sending ping to Gemini...")
         response = client.models.generate_content(
-            model='gemini-3-flash-preview', # Use the latest standard model
+            model='gemini-2.5-flash', # Use the latest standard model
             contents='Return the exact string: "API Connection Successful."'
         )
         print(f"Response: {response.text}")

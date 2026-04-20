@@ -64,6 +64,9 @@ def main():
                 
         except KeyboardInterrupt:
             break
+        except Exception as e:
+            print(f"[Node {my_id}] Command failed without exiting: {e}")
+            continue
 
 if __name__ == "__main__":
     main()

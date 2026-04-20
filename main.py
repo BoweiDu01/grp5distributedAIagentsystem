@@ -2,7 +2,7 @@ import sys
 import time
 from core.node import Node
 
-LIVENESS_TIMEOUT_SECONDS = 10
+LIVENESS_TIMEOUT_SECONDS = 20
 
 
 def main():

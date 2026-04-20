@@ -1,5 +1,6 @@
 import os
 from google import genai
+from dotenv import load_dotenv
 
 # Ensure you have set your GEMINI_API_KEY environment variable
 # e.g., in terminal: set GEMINI_API_KEY="your_api_key" (Windows) 
@@ -7,9 +8,16 @@ from google import genai
 
 def test_api():
     try:
-        # The new SDK automatically picks up the GEMINI_API_KEY env variable
+        # Load environment variables from .env before creating the client.
+        load_dotenv()
+
+        if not os.getenv("GEMINI_API_KEY"):
+            print("Failed to connect: GEMINI_API_KEY is not set. Check your .env file.")
+            return
+
+        # The SDK picks up GEMINI_API_KEY from environment variables.
         client = genai.Client()
-        
+
         print("Sending ping to Gemini...")
         response = client.models.generate_content(
             model='gemini-2.5-flash', # Use the latest standard model

@@ -2,6 +2,9 @@ import sys
 import time
 from core.node import Node
 
+LIVENESS_TIMEOUT_SECONDS = 10
+
+
 def main():
     if len(sys.argv) < 2:
         print("Usage: python main.py <port> <peer_port1> <peer_port2> ...")
@@ -9,11 +12,16 @@ def main():
 
     my_port = int(sys.argv[1])
     # Assume node ID is just the port number for now
-    my_id = str(my_port) 
+    my_id = str(my_port)
     peer_ports = [int(p) for p in sys.argv[2:]]
 
     # Initialize the node
-    node = Node(node_id=my_id, port=my_port, peer_ports=peer_ports)
+    node = Node(
+        node_id=my_id,
+        port=my_port,
+        peer_ports=peer_ports,
+        liveness_timeout=LIVENESS_TIMEOUT_SECONDS,
+    )
 
     # Let the server spin up
     time.sleep(1)
@@ -26,11 +34,11 @@ def main():
             )
             if cmd.lower() == 'exit':
                 break
-            
+
             elif cmd.lower() == 'ping':
                 for peer in peer_ports:
                     node.send_message(peer, "receive_ping", "Hello!")
-                    
+
             elif cmd.lower() == 'write':
                 # Trigger Ricart-Agrawala
                 node.request_critical_section()
@@ -56,17 +64,18 @@ def main():
 
             elif cmd.lower() == 'afs_status':
                 node.afs_status()
-                
+
             # --- PHASE 5 AI INTEGRATION ---
             elif cmd.lower().startswith('prompt '):
-                user_prompt = cmd[7:] # Extract the text after "prompt "
+                user_prompt = cmd[7:]  # Extract the text after "prompt "
                 node.handle_user_prompt(user_prompt)
-                
+
         except KeyboardInterrupt:
             break
         except Exception as e:
             print(f"[Node {my_id}] Command failed without exiting: {e}")
             continue
+
 
 if __name__ == "__main__":
     main()

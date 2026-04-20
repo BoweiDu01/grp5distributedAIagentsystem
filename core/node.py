@@ -374,6 +374,7 @@ class Node:
             path = self._replica_path(safe_name)
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(payload, f)
+            print(f"[AFS][Node {self.node_id}] Stored local replica: {safe_name} v{int(version)} -> {path}")
 
             with self.afs_lock:
                 self.afs_index[safe_name] = {
@@ -390,11 +391,13 @@ class Node:
             safe_name = self._sanitize_afs_filename(filename)
             path = self._replica_path(safe_name)
             if not os.path.exists(path):
+                print(f"[AFS][Node {self.node_id}] Local replica miss: {safe_name}")
                 return {"ok": False}
 
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     payload = json.load(f)
+                print(f"[AFS][Node {self.node_id}] Local replica fetch: {safe_name} v{int(payload.get('version', 0))}")
                 return {
                     "ok": True,
                     "filename": safe_name,
@@ -402,6 +405,7 @@ class Node:
                     "content": payload.get("content", ""),
                 }
             except Exception:
+                print(f"[AFS][Node {self.node_id}] Failed to parse local replica: {safe_name}")
                 return {"ok": False}
 
         def afs_write(self, filename, content):
@@ -416,23 +420,31 @@ class Node:
                 print(f"[Node {self.node_id}] No replicas available for write.")
                 return False
 
+            print(f"[AFS][Node {self.node_id}] WRITE start: {safe_name} replicas={replicas}")
+
             self.request_critical_section()
             success = False
             try:
                 latest = self._read_latest_record(safe_name)
                 new_version = latest["version"] + 1 if latest else 1
+                print(f"[AFS][Node {self.node_id}] WRITE version chosen: {safe_name} v{new_version}")
 
                 required_acks = (len(replicas) // 2) + 1
                 ack_count = 0
 
                 for peer in replicas:
                     if peer == self.port:
+                        print(f"[AFS][Node {self.node_id}] WRITE local store on Node {self.port}: {safe_name} v{new_version}")
                         self._local_store_replica(safe_name, content, new_version)
                         ack_count += 1
                     else:
+                        print(f"[AFS][Node {self.node_id}] WRITE sending replica to Node {peer}: {safe_name} v{new_version}")
                         ack = self.send_message(peer, "receive_afs_store_replica", safe_name, content, new_version)
                         if ack:
                             ack_count += 1
+                            print(f"[AFS][Node {self.node_id}] WRITE ack from Node {peer}: {safe_name} v{new_version}")
+                        else:
+                            print(f"[AFS][Node {self.node_id}] WRITE no ack from Node {peer}: {safe_name} v{new_version}")
 
                 if ack_count >= required_acks:
                     for peer in self.peer_ports:
@@ -453,19 +465,23 @@ class Node:
                 print(f"[Node {self.node_id}] Invalid filename.")
                 return None
 
+            replicas = self._replica_ports(safe_name)
+            print(f"[AFS][Node {self.node_id}] READ start: {safe_name} replicas={replicas}")
+
             latest = self._read_latest_record(safe_name)
             if not latest:
                 print(f"[Node {self.node_id}] AFS read miss: {safe_name}")
                 return None
 
             # Best-effort read repair for missing or stale replicas.
-            replicas = self._replica_ports(safe_name)
             for peer in replicas:
                 if peer == self.port:
                     local = self._local_fetch_replica(safe_name)
                     if (not local.get("ok")) or int(local.get("version", 0)) < latest["version"]:
+                        print(f"[AFS][Node {self.node_id}] READ repair local replica: {safe_name} -> v{latest['version']}")
                         self._local_store_replica(safe_name, latest["content"], latest["version"])
                 else:
+                    print(f"[AFS][Node {self.node_id}] READ repair send to Node {peer}: {safe_name} v{latest['version']}")
                     self.send_message(peer, "receive_afs_store_replica", safe_name, latest["content"], latest["version"])
 
             with self.afs_lock:
@@ -480,17 +496,21 @@ class Node:
         def _read_latest_record(self, filename):
             replicas = self._replica_ports(filename)
             candidates = []
+            print(f"[AFS][Node {self.node_id}] READ-LATEST querying replicas for {filename}: {replicas}")
 
             for peer in replicas:
                 if peer == self.port:
                     data = self._local_fetch_replica(filename)
                 else:
+                    print(f"[AFS][Node {self.node_id}] READ-LATEST fetch request to Node {peer}: {filename}")
                     data = self.send_message(peer, "receive_afs_fetch", filename)
 
                 if data and isinstance(data, dict) and data.get("ok"):
                     candidates.append(data)
+                    print(f"[AFS][Node {self.node_id}] READ-LATEST candidate: {filename} v{int(data.get('version', 0))}")
 
             if not candidates:
+                print(f"[AFS][Node {self.node_id}] READ-LATEST no candidates for {filename}")
                 return None
 
             return max(candidates, key=lambda item: int(item.get("version", 0)))
@@ -508,9 +528,11 @@ class Node:
         def receive_afs_store_replica(self, sender_clock, sender_id, filename, content, version):
             self.sync_clock(sender_clock)
             safe_name = self._sanitize_afs_filename(filename)
+            print(f"[AFS][Node {self.node_id}] RPC store replica from Node {sender_id}: {safe_name} v{int(version)}")
             current = self._local_fetch_replica(safe_name)
             
             if current.get("ok") and int(current.get("version", 0)) > int(version):
+                print(f"[AFS][Node {self.node_id}] RPC store skipped (newer local exists): {safe_name} local_v{int(current.get('version', 0))} incoming_v{int(version)}")
                 return True
 
             self._local_store_replica(safe_name, content, int(version))
@@ -530,6 +552,9 @@ class Node:
                 callbacks = list(self.afs_index[safe_name].get("callbacks", []))
                 # Clear it immediately so the lock is freed fast.
                 self.afs_index[safe_name]["callbacks"] = set()
+
+            if callbacks:
+                print(f"[AFS][Node {self.node_id}] Invalidate callbacks for {safe_name} v{int(version)} -> {callbacks}")
 
             # Perform network I/O OUTSIDE the lock
             for client_port in callbacks:
@@ -559,6 +584,7 @@ class Node:
             """Replica side: Send data and register the requester for callbacks."""
             self.sync_clock(sender_clock)
             safe_name = self._sanitize_afs_filename(filename)
+            print(f"[AFS][Node {self.node_id}] RPC fetch from Node {sender_id}: {safe_name}")
             data = self._local_fetch_replica(safe_name)
             
             if data.get("ok"):
@@ -576,6 +602,7 @@ class Node:
         def receive_afs_invalidate(self, sender_clock, sender_id, filename, version):
             self.sync_clock(sender_clock)
             safe_name = self._sanitize_afs_filename(filename)
+            print(f"[AFS][Node {self.node_id}] RPC invalidate from Node {sender_id}: {safe_name} -> v{int(version)}")
             with self.afs_lock:
                 cache_entry = self.afs_cache.get(safe_name)
                 if cache_entry and int(cache_entry.get("version", 0)) < int(version):

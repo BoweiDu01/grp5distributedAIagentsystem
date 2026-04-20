@@ -134,7 +134,8 @@ class Node:
         time.sleep(5)
         if self.is_leader or self.leader_id is not None:
             return
-        print(f"[Node {self.node_id}] No leader announced yet. Starting election.")
+        print(
+            f"[Node {self.node_id}] No leader announced yet. Starting election.")
         self.start_election()
 
     def _mark_peer_alive(self, peer_port):
@@ -159,11 +160,13 @@ class Node:
 
     def _request_cs_permission(self, peer_port, req_timestamp):
         """Send one RA request and stop waiting for peers that time out immediately."""
-        reply = self.send_message(peer_port, "receive_cs_request", req_timestamp)
+        reply = self.send_message(
+            peer_port, "receive_cs_request", req_timestamp)
         if reply is None:
             with self.cs_lock:
                 self.cs_pending_replies.discard(int(peer_port))
-            self._mark_peer_dead(peer_port, f"no CS request ACK within {self.liveness_timeout}s")
+            self._mark_peer_dead(
+                peer_port, f"no CS request ACK within {self.liveness_timeout}s")
 
     def _await_coordinator(self, round_id):
         """If no coordinator arrives in time, restart election for this node."""
@@ -193,7 +196,8 @@ class Node:
                 return result
 
         except (ConnectionRefusedError, socket.timeout, OSError):
-            self._mark_peer_dead(target_port, f"RPC {method_name} timeout/refused")
+            self._mark_peer_dead(
+                target_port, f"RPC {method_name} timeout/refused")
             return None
 
     # --- RPC Exposed Methods (Callable by other nodes) ---
@@ -366,7 +370,8 @@ class Node:
                     print(
                         f"[Node {self.node_id}] CS wait timed out ({self.liveness_timeout}s). Proceeding without replies from: {timed_out}")
                     for peer in timed_out:
-                        self._mark_peer_dead(peer, f"no CS reply within {self.liveness_timeout}s")
+                        self._mark_peer_dead(
+                            peer, f"no CS reply within {self.liveness_timeout}s")
                 break
             time.sleep(0.1)
 
@@ -414,6 +419,8 @@ class Node:
             else:
                 # We don't care, or they have priority. REPLY immediately.
                 peer_port = int(sender_id)
+                print(
+                    f"[Node {self.node_id}] Sending immediate CS reply to Node {sender_id}")
                 threading.Thread(
                     target=self.send_message,
                     args=(peer_port, "receive_cs_reply"),
@@ -429,7 +436,8 @@ class Node:
         with self.cs_lock:
             if sender_port in self.cs_pending_replies:
                 self.cs_pending_replies.remove(sender_port)
-            self.cs_replies_received = self.cs_expected_replies - len(self.cs_pending_replies)
+            self.cs_replies_received = self.cs_expected_replies - \
+                len(self.cs_pending_replies)
             print(
                 f"[Node {self.node_id}] Received CS permission from Node {sender_id} ({self.cs_replies_received}/{self.cs_expected_replies})")
         return True

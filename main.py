@@ -36,6 +36,23 @@ def main():
                 break
 
             elif cmd.lower() == 'ping':
+                if not node.is_leader:
+                    leader_port = node._leader_port()
+                    if leader_port is None:
+                        print(
+                            f"[Node {my_id}] No known leader during ping. Triggering election.")
+                        node.start_election()
+                    else:
+                        probe = node.send_message(
+                            leader_port,
+                            "receive_ping",
+                            "ping-leader-liveness-check"
+                        )
+                        if probe is None:
+                            print(
+                                f"[Node {my_id}] Leader Node {leader_port} is down. Triggering election.")
+                            node.start_election()
+
                 for peer in peer_ports:
                     node.send_message(peer, "receive_ping", "Hello!")
 

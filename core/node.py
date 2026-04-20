@@ -126,7 +126,7 @@ class Node:
                             
                     return result
                     
-            except (ConnectionRefusedError, socket.timeout, OSError):
+            except (ConnectionRefusedError, socket.timeout, OSError, xmlrpc.client.Fault, xmlrpc.client.ProtocolError):
                 # If the connection fails, remove them from the active pool
                 with self.peer_lock:
                     if target_port in self.active_peers:
@@ -591,11 +591,18 @@ class Node:
             
             if data.get("ok"):
                 with self.afs_lock:
-                    # Ensure the index entry exists
+                    # Ensure the index entry exists and always has a callbacks set.
                     if safe_name not in self.afs_index:
-                        self.afs_index[safe_name] = {"version": data["version"], "callbacks": set()}
-                    
-                    # Register the requester's port for future invalidations
+                        self.afs_index[safe_name] = {
+                            "version": data["version"],
+                            "replicas": self._replica_ports(safe_name),
+                            "updated_at": time.time(),
+                            "callbacks": set(),
+                        }
+                    else:
+                        self.afs_index[safe_name].setdefault("callbacks", set())
+
+                    # Register the requester's port for future invalidations.
                     self.afs_index[safe_name]["callbacks"].add(int(sender_id))
                     print(f"[AFS] Registered callback for Node {sender_id} on file '{safe_name}'")
                     

@@ -901,25 +901,38 @@ class Node:
         return True
 
     def execute_task(self, sender_clock, sender_id, task):
-        """Follower acts as Worker, commits via AFS, then mirrors locally."""
+        """Acknowledges the task instantly, then processes it in the background."""
         self.sync_clock(sender_clock)
         target_name = task.get('filename', 'generated.py')
-        print(f"\n[Worker {self.node_id}] Writing code for {target_name}...")
+        print(f"\n[Worker {self.node_id}] Received task '{target_name}'. Spawning background thread...")
+
+        # Spawn a background thread for the heavy lifting so we don't block the RPC response
+        threading.Thread(
+            target=self._process_task_background, 
+            args=(task,), 
+            daemon=True
+        ).start()
+
+        # Instantly return True so the Leader doesn't trigger a network timeout
+        return True
+
+    def _process_task_background(self, task):
+        """The actual heavy lifting (Gemini API, AFS, DME) moved here."""
+        target_name = task.get('filename', 'generated.py')
+        print(f"[Worker {self.node_id}] Background thread writing code for {target_name}...")
 
         # Call Gemini to write the code
         code = self._worker_execute(task)
         if not code:
             reason = self.last_ai_error or "AI returned empty response."
-            print(
-                f"[Worker {self.node_id}] Prompt failed for {target_name}: {reason}")
+            print(f"[Worker {self.node_id}] Prompt failed for {target_name}: {reason}")
             return False
 
         try:
             afs_key = self._afs_key_for_ai_file(target_name)
             committed = self.afs_write(afs_key, code)
             if not committed:
-                print(
-                    f"[Worker {self.node_id}] AFS commit failed for {target_name}.")
+                print(f"[Worker {self.node_id}] AFS commit failed for {target_name}.")
                 return False
 
             latest_code = self.afs_read(afs_key)
@@ -936,8 +949,7 @@ class Node:
             finally:
                 self.release_critical_section()
 
-            print(
-                f"[Worker {self.node_id}] AFS committed as '{afs_key}', mirrored to ./{local_path}")
+            print(f"[Worker {self.node_id}] AFS committed as '{afs_key}', mirrored to ./{local_path}")
 
         except Exception as e:
             print(f"[Worker {self.node_id}] File I/O Error: {e}")

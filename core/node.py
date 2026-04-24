@@ -489,6 +489,7 @@ class Node:
                 "version": int(version),
                 "replicas": self._replica_ports(safe_name),
                 "updated_at": payload["updated_at"],
+                "callbacks": set(),
             }
             self.afs_cache[safe_name] = {
                 "version": int(version),
@@ -731,7 +732,14 @@ class Node:
                 # Ensure the index entry exists
                 if safe_name not in self.afs_index:
                     self.afs_index[safe_name] = {
-                        "version": data["version"], "callbacks": set()}
+                        "version": data["version"],
+                        "replicas": self._replica_ports(safe_name),
+                        "updated_at": time.time(),
+                        "callbacks": set(),
+                    }
+
+                # Backfill callback set for older entries created before callback support.
+                self.afs_index[safe_name].setdefault("callbacks", set())
 
                 # Register the requester's port for future invalidations
                 self.afs_index[safe_name]["callbacks"].add(int(sender_id))

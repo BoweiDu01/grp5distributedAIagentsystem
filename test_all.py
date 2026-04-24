@@ -1,7 +1,6 @@
 import os
 import shutil
-import subprocess
-import sys
+import socket
 import threading
 import time
 from typing import Dict, Optional, Tuple
@@ -19,27 +18,28 @@ def _assert(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
-def _cleanup_artifacts() -> None:
-    for path in ["ai_workspace", "afs_storage"]:
+def _reserve_test_ports(count: int = 3) -> list[int]:
+    """Find currently available localhost ports for this integration run."""
+    sockets = []
+    try:
+        ports = []
+        for _ in range(count):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.bind(("localhost", 0))
+            sockets.append(sock)
+            ports.append(sock.getsockname()[1])
+        return ports
+    finally:
+        for sock in sockets:
+            sock.close()
+
+
+def _cleanup_artifacts(ports: list[int]) -> None:
+    """Remove only storage directories created for this test run."""
+    for port in ports:
+        path = os.path.join("afs_storage", f"node_{port}")
         if os.path.isdir(path):
             shutil.rmtree(path)
-
-
-def _test_gemini_preflight() -> Tuple[bool, str]:
-    """Run test_gemini.py first; fail fast if Gemini is not reachable."""
-    cmd = [sys.executable, "test_gemini.py"]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    except Exception as exc:
-        return False, f"Failed to execute test_gemini.py: {exc}"
-
-    output = f"{proc.stdout}\n{proc.stderr}".strip()
-    failed = proc.returncode != 0 or "Failed to connect:" in output
-
-    if failed:
-        return False, output or "Gemini preflight failed with no output"
-
-    return True, output
 
 
 def _wait_for_leader(nodes: Dict[str, Node], timeout: float = 15.0) -> Tuple[Optional[str], Optional[str]]:
@@ -116,22 +116,19 @@ def run_all_tests() -> int:
     if load_dotenv is not None:
         load_dotenv()
 
-    ok, preflight_output = _test_gemini_preflight()
-    if not ok:
-        print("\nTEST FAILED: Gemini preflight did not pass. Canceling remaining tests.")
-        print(preflight_output)
-        return 1
+    print("Starting distributed tests...")
 
-    print("Gemini preflight passed. Starting distributed tests...")
+    ports = _reserve_test_ports(3)
+    _cleanup_artifacts(ports)
 
-    _cleanup_artifacts()
-
-    # Use dedicated ports for integration tests to avoid collisions with manual runs.
-    ports = [5101, 5102, 5103]
+    node_ids = [str(port) for port in ports]
     nodes = {
-        "5101": Node(node_id="5101", port=5101, peer_ports=[5102, 5103]),
-        "5102": Node(node_id="5102", port=5102, peer_ports=[5101, 5103]),
-        "5103": Node(node_id="5103", port=5103, peer_ports=[5101, 5102]),
+        node_id: Node(
+            node_id=node_id,
+            port=port,
+            peer_ports=[peer for peer in ports if peer != port],
+        )
+        for node_id, port in zip(node_ids, ports)
     }
 
     time.sleep(1.5)
@@ -141,30 +138,33 @@ def run_all_tests() -> int:
     try:
         leader_id, err = _wait_for_leader(nodes)
         _assert(err is None and leader_id is not None, err or "Unknown leader election failure")
-        _assert(leader_id == "5103", f"Expected leader 5103, got {leader_id}")
+        expected_leader = str(max(ports))
+        _assert(leader_id == expected_leader, f"Expected leader {expected_leader}, got {leader_id}")
         results.append(("Leader election", "PASSED"))
 
-        _test_ping(nodes["5101"], 5102)
+        _test_ping(nodes[node_ids[0]], ports[1])
         results.append(("Ping/Lamport RPC", "PASSED"))
 
-        _test_mutual_exclusion(nodes["5101"], nodes["5102"])
+        _test_mutual_exclusion(nodes[node_ids[0]], nodes[node_ids[1]])
         results.append(("Ricart-Agrawala mutex", "PASSED"))
 
-        _test_afs(nodes["5101"], nodes["5102"], nodes["5103"])
+        _test_afs(nodes[node_ids[0]], nodes[node_ids[1]], nodes[node_ids[2]])
         results.append(("AFS-lite replication", "PASSED"))
 
-        ai_result = _test_ai_optional(nodes["5103"])
+        ai_result = _test_ai_optional(nodes[expected_leader])
         results.append(("Gemini connectivity", ai_result))
 
     except Exception as exc:
         print(f"\nTEST FAILED: {exc}")
         for name, status in results:
             print(f"- {name}: {status}")
+        _cleanup_artifacts(ports)
         return 1
 
     print("\nALL TESTS COMPLETE")
     for name, status in results:
         print(f"- {name}: {status}")
+    _cleanup_artifacts(ports)
     return 0
 
 

@@ -59,10 +59,12 @@ To simulate the distributed network locally, you must spin up multiple nodes in 
 **Expected Result:** The node will multicast a message to its peers. You will see the receiving nodes update their Lamport logical clocks based on the sender's timestamp.
 
 ### 2. Test Leader Election (Bully Algorithm)
-* Upon startup, the nodes will wait ~5 seconds. Because no leader exists, they will automatically trigger an election.
+* Upon startup, the nodes will wait ~5 seconds	. Because no leader exists, they will automatically trigger an election.
 * Node 5003 (the highest ID) will announce `*** [Node 5003] I am the new LEADER! ***`.
-* **To test recovery:** Go to Terminal 3 (Node 5003) and terminate the process (`Ctrl + C`).
-**Expected Result:** After exactly 6 seconds of missing heartbeats, Nodes 5001 and 5002 will trigger a new election. Node 5002 will take over as the new Leader.
+* **To test recovery:** Go to Terminal 3 (Node 5003) and terminate the process (`Ctrl + C`). Afterwards, type 'ping' on any of the other nodes.
+**Expected Result:** After a process that checks for the liveness of the leader node is activated (such as ping or prompt), the active nodes will then trigger a reelection. In this case, Nodes 5001 and 5002 will trigger a new election and Node 5002 will take over as the new Leader.
+* Afterwards, restart Node 5003 by spinning it up in another terminal via `python main.py 5003 5001 5002`
+**Expected Result:** The new node will trigger an election, and since the new node has the highest ID, it will be elected. Node 5003 is once again the new leader node.
 
 ### 3. Test Distributed Mutual Exclusion (Ricart-Agrawala)
 * Go to Terminal 1 and type `write`. It will request the Critical Section (CS), enter it, and simulate a 5-second file write.
@@ -122,7 +124,7 @@ The cluster now supports a lightweight Andrew File System style layer with repli
 
 **Expected Result:** 
 1. Planning: The Leader (Planner) uses Gemini to break down the user request into separate files and instructions.
-2. Security Scan: The Leader performs a fast local scan to block destructive I/O commands (replacing the slower PBFT consensus).
+2. Security Scan: The Leader performs a fast local scan to block destructive I/O commands.
 3. Delegation: Approved tasks are delegated to worker nodes in a round-robin fashion.
 4. Execution & AFS Commit: Workers call Gemini to write the code and commit it to the distributed AFS network using afs_write, storing it safely across node replicas.
 5. Local Mirroring: After securing the code in AFS, the worker retrieves the latest version and writes a materialized copy to its local ai_workspace/ directory. It uses Distributed Mutual Exclusion (Ricart-Agrawala) during this step to prevent local I/O race conditions.

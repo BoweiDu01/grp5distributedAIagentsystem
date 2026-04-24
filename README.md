@@ -16,8 +16,8 @@ This project is a decentralized framework built from scratch in Python. It simul
 ## Setup
 1. Create a virtual environment to keep your workspace clean: `python -m venv .venv`
 2. Activate the virtual environment: 
-	* On Windows `venv\Scripts\activate` 
-	* On Max/Linux `source venv/bin/activate`
+	* On Windows `.venv\Scripts\activate` 
+	* On Max/Linux `source .venv/bin/activate`
 3. Install dependencies: `pip install -r requirements.txt`
 4. Set up your Gemini API key as an environment variable or in your code. You can obtain one via the Google AI Studio https://ai.google.dev/gemini-api/docs/api-key
 

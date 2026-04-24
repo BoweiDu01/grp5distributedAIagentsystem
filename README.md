@@ -15,8 +15,32 @@ This project is a decentralized framework built from scratch in Python. It simul
 * Google Gemini API key (for Phase 5 AI features)
 
 ## Setup
-1. Install dependencies: `pip install google-genai`
-2. Set up your Gemini API key as an environment variable or in your code.
+1. Create a virtual environment to keep your workspace clean: `python -m venv .venv`
+2. Activate the virtual environment: 
+	On Windows `venv\Scripts\activate` 
+	On Max/Linux `source venv/bin/activate`
+3. Install dependencies: `pip install -r requirements.txt`
+4. Set up your Gemini API key as an environment variable or in your code. You can obtain one via the Google AI Studio https://ai.google.dev/gemini-api/docs/api-key
+
+Follow these steps to create your key:
+
+	1. Go to Create or View a Gemini API Key.
+
+	2. Select Project (Left sidebar) -> Create a New Project.
+
+	3. Name your Project (e.g., grp1) -> Create Project.
+
+	4. Select API Keys (Left sidebar) -> Create API Key.
+
+	5. Name your key (e.g., grp1apikey).
+
+	6. Choose the imported project you just created (grp1) -> Create Key.
+
+Create a .env file in the root directory of the project and copy your new API key into it exactly like this: `GEMINI_API_KEY=your_actual_api_key_here`
+
+If your API Key has been successfully set up, run the test script: `python test_gemini.py`
+If successful, you will see 
+`Sending Ping to Gemini... Response: API Connection Successful`
 
 ## How to Run the Cluster
 

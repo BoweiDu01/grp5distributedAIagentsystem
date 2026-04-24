@@ -122,6 +122,7 @@ The cluster now supports a lightweight Andrew File System style layer with repli
 
 **Expected Result:** 
 1. Planning: The Leader (Planner) uses Gemini to break down the user request into separate files and instructions.
-2. Security Scan: The Leader performs a fast local scan to block destructive I/O commands (replacing the slower PBFT consensus).3. Delegation: Approved tasks are delegated to worker nodes in a round-robin fashion.
+2. Security Scan: The Leader performs a fast local scan to block destructive I/O commands (replacing the slower PBFT consensus).
+3. Delegation: Approved tasks are delegated to worker nodes in a round-robin fashion.
 4. Execution & AFS Commit: Workers call Gemini to write the code and commit it to the distributed AFS network using afs_write, storing it safely across node replicas.
 5. Local Mirroring: After securing the code in AFS, the worker retrieves the latest version and writes a materialized copy to its local ai_workspace/ directory. It uses Distributed Mutual Exclusion (Ricart-Agrawala) during this step to prevent local I/O race conditions.

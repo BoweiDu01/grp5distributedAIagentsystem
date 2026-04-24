@@ -80,7 +80,9 @@ class Node:
         self.afs_index = {}
         self.replication_factor = min(3, len(self.peer_ports) + 1)
         self.afs_storage_dir = os.path.join("afs_storage", f"node_{self.port}")
-        os.makedirs(self.afs_storage_dir, exist_ok=True)
+        # Use the correct variable name here:
+        if not os.path.exists(self.afs_storage_dir):
+            os.makedirs(self.afs_storage_dir, exist_ok=True)
 
         # Phase 5: AI Integration
         self._load_env()
@@ -88,7 +90,7 @@ class Node:
             if not os.getenv("GEMINI_API_KEY"):
                 raise ValueError("GEMINI_API_KEY is not set.")
             self.ai_client = genai.Client()
-            self.ai_model = 'gemini-2.5-flash'
+            self.ai_model = 'gemini-3-flash-preview'
         except Exception as e:
             print(
                 f"[Node {self.node_id}] Warning: AI client failed to initialize. {e}")

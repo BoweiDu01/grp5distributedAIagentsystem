@@ -56,19 +56,23 @@ To simulate the distributed network locally, you must spin up multiple nodes in 
 
 ### 1. Test Network & Lamport Clocks
 * Go to any terminal and type `ping`.
+  
 **Expected Result:** The node will multicast a message to its peers. You will see the receiving nodes update their Lamport logical clocks based on the sender's timestamp.
 
 ### 2. Test Leader Election (Bully Algorithm)
 * Upon startup, the nodes will wait ~5 seconds	. Because no leader exists, they will automatically trigger an election.
 * Node 5003 (the highest ID) will announce `*** [Node 5003] I am the new LEADER! ***`.
 * **To test recovery:** Go to Terminal 3 (Node 5003) and terminate the process (`Ctrl + C`). Afterwards, type 'ping' on any of the other nodes.
+
 **Expected Result:** After a process that checks for the liveness of the leader node is activated (such as ping or prompt), the active nodes will then trigger a reelection. In this case, Nodes 5001 and 5002 will trigger a new election and Node 5002 will take over as the new Leader.
 * Afterwards, restart Node 5003 by spinning it up in another terminal via `python main.py 5003 5001 5002`
+
 **Expected Result:** The new node will trigger an election, and since the new node has the highest ID, it will be elected. Node 5003 is once again the new leader node.
 
 ### 3. Test Distributed Mutual Exclusion (Ricart-Agrawala)
 * Go to Terminal 1 and type `write`. It will request the Critical Section (CS), enter it, and simulate a 5-second file write.
 * **To test collision/deferral:** Type `write` in Terminal 1, and *immediately* switch to Terminal 2 and type `write`.
+
 **Expected Result:** Terminal 1 will enter the CS. Terminal 2 will request it, but Terminal 1 will log `Deferring CS request from Node 5002`. Terminal 2 will wait until Terminal 1 finishes and releases the lock.
 
 ### 4. Test AFS-lite Fault-Tolerant File Storage
